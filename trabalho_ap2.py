@@ -3,92 +3,98 @@ from pathlib import Path
 import time
 import requests
 import matplotlib.pyplot as plt
+import numpy as np
 
 # ==========================================
-# --- 1. PARÂMETROS E CONFIGURAÇÕES GERAIS ---
+# --- 1. CONFIGURAÇÕES E APIS -------------
 # ==========================================
 path = Path(__file__).parent.resolve()
 
-# Parâmetros Macroeconômicos e de Exportação (2025)
-CAMBIO_2025 = 5.10
-receitas_br_brl = {
-    'Klabin': 11.2,  
-    'Marfrig': 48.5, 
-    'Weg': 23.2      
-}
-
-# Parâmetros Financeiros e API
-token = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ0b2tlbl90eXBlIjoiYWNjZXNzIiwiZXhwIjoxNzgwNTcwNzA4LCJpYXQiOjE3Nzc5Nzg3MDgsImp0aSI6IjNmNTBiZWM4OWVkZDQzMWI5NTljZWFkYmFkZTdiNjYyIiwidXNlcl9pZCI6IjExOCJ9.4m2iY0iB32ZKdO6_uZb-H1Cu9zwOXJcenbCHAv-qTFE"
-headers = {"Authorization": f"Bearer {token}"}
-base_url = "https://laboratoriodefinancas.com/api/v2"
-
-# Mapeamento de Empresas para Tickers
+# Mapeamento de Tickers e Premissas
 tickers = {
     'Marfrig': 'MBRF3',
     'Klabin': 'KLBN11',
     'Weg': 'WEGE3'
 }
 
-# Estimativas para o cálculo do EVA
-parametros_eva = {
-    'MBRF3':  {'roi': 0.12, 'cmpc': 0.10}, 
-    'KLBN11': {'roi': 0.15, 'cmpc': 0.11},
-    'WEGE3':  {'roi': 0.22, 'cmpc': 0.13}
-}
-
+token = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ0b2tlbl90eXBlIjoiYWNjZXNzIiwiZXhwIjoxNzgwNTcwNzA4LCJpYXQiOjE3Nzc5Nzg3MDgsImp0aSI6IjNmNTBiZWM4OWVkZDQzMWI5NTljZWFkYmFkZTdiNjYyIiwidXNlcl9pZCI6IjExOCJ9.4m2iY0iB32ZKdO6_uZb-H1Cu9zwOXJcenbCHAv-qTFE"
+headers = {"Authorization": f"Bearer {token}"}
+base_url = "https://laboratoriodefinancas.com/api/v2"
 
 # ==========================================
-# --- 2. ANÁLISE DE EXPORTAÇÕES E HHI ---
+# --- 2. COLETA DE CÂMBIO DINÂMICO (SGS) ---
 # ==========================================
-file_path = path / 'produtos_industria_transformacao.csv'
-df_sh4 = pd.read_csv(file_path, sep=';', decimal=',', encoding='utf-8')
+def fetch_bcb_exchange_rates():
+    url = "https://api.bcb.gov.br/dados/serie/bcdata.sgs.1/dados?formato=json&dataInicial=01/01/2024&dataFinal=31/12/2025"
+    h = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+    }
+    max_retries = 5
+    delay = 10
+    print("[SGS BCB] Buscando série histórica do Dólar (diário)...")
+    for attempt in range(max_retries):
+        try:
+            r = requests.get(url, headers=h, timeout=30)
+            if r.status_code == 200:
+                data = r.json()
+                df = pd.DataFrame(data)
+                df['valor'] = pd.to_numeric(df['valor'], errors='coerce')
+                df['data'] = pd.to_datetime(df['data'], format='%d/%m/%Y')
+                df['year'] = df['data'].dt.year
+                
+                averages = df.groupby('year')['valor'].mean().to_dict()
+                print(f"[SGS BCB] Sucesso! Médias anuais calculadas: 2024={averages.get(2024, 0.0):.4f}, 2025={averages.get(2025, 0.0):.4f}")
+                return averages
+            else:
+                print(f"[SGS BCB] Erro {r.status_code}. Tentando novamente em {delay}s...")
+                time.sleep(delay)
+        except Exception as e:
+            print(f"[SGS BCB] Exceção: {e}. Tentando novamente em {delay}s...")
+            time.sleep(delay)
+    print("[SGS BCB] Falha ao obter dados. Utilizando taxas de fallback (2024=5.3920, 2025=5.5855)")
+    return {2024: 5.392016, 2025: 5.585500}
 
-col_valor_usd = '2025 - Valor US$ FOB'
-df_sh4[col_valor_usd] = pd.to_numeric(df_sh4[col_valor_usd], errors='coerce').fillna(0)
-total_it_usd = df_sh4[col_valor_usd].sum()
+exchange_rates = fetch_bcb_exchange_rates()
+CAMBIO_2024 = exchange_rates.get(2024, 5.392016)
+CAMBIO_2025 = exchange_rates.get(2025, 5.585500)
 
-df_sh4['share'] = df_sh4[col_valor_usd] / total_it_usd
-hhi_pauta = (df_sh4['share'] ** 2).sum()
-
-df_empresas = pd.DataFrame(list(receitas_br_brl.items()), columns=['Empresa', 'Receita_BRL'])
-df_empresas['Receita_USD'] = (df_empresas['Receita_BRL'] * 1e9) / CAMBIO_2025
-df_empresas['Participacao_IT_%'] = (df_empresas['Receita_USD'] / total_it_usd) * 100
-
-# --- 2.1 ANÁLISE HISTÓRICA CONSOLIDADA (PD.MERGE) ---
-# Função para buscar dados da API Comex Stat com retry em caso de erro 429
+# ==========================================
+# --- 3. EXPORTAÇÕES E HISTÓRICO COMEXST ---
+# ==========================================
 def fetch_comex_data(name, filters, details):
     url_query = "https://api-comexstat.mdic.gov.br/general?language=pt"
     payload = {
         "flow": "export",
         "monthDetail": True,
         "period": {
-            "from": "2016-01",
-            "to": "2026-12"  # Contorna o bug do filtro de meses na API Comex Stat
+            "from": "2015-01",
+            "to": "2025-12"
         },
         "filters": filters,
         "details": details,
         "metrics": ["metricFOB", "metricKG"]
     }
-    max_retries = 5
-    delay = 12
+    h = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+        'Content-Type': 'application/json'
+    }
+    max_retries = 3
+    delay = 10
+    # Sleep mandatório para respeitar rate limits da API
+    time.sleep(delay)
     for attempt in range(max_retries):
-        print(f"[{name}] Buscando dados na API Comex Stat (tentativa {attempt + 1}/{max_retries})...")
         try:
-            r = requests.post(url_query, json=payload, timeout=30)
+            r = requests.post(url_query, json=payload, headers=h, timeout=30)
             if r.status_code == 200:
                 data = r.json().get('data', {}).get('list', [])
-                print(f"[{name}] Sucesso! {len(data)} registros retornados.")
                 return data
             elif r.status_code == 429:
-                print(f"[{name}] Limite de requisições (429). Aguardando {delay}s...")
                 time.sleep(delay)
             else:
-                print(f"[{name}] Erro {r.status_code}: {r.text}. Aguardando {delay}s...")
                 time.sleep(delay)
-        except Exception as e:
-            print(f"[{name}] Exceção: {e}. Aguardando {delay}s...")
+        except Exception:
             time.sleep(delay)
-    raise RuntimeError(f"Falha crítica ao buscar dados para {name} após {max_retries} tentativas.")
+    raise RuntimeError("Rate limit ou timeout no Comex Stat")
 
 def process_comex_df(raw_data, is_celulose=False, is_total=False):
     if not raw_data:
@@ -107,14 +113,12 @@ def process_comex_df(raw_data, is_celulose=False, is_total=False):
     }).reset_index()
     
     grouped['periodo'] = pd.to_datetime(grouped['year'] + '-' + grouped['monthNumber'])
-    grouped = grouped[grouped['periodo'] <= '2026-04']
+    grouped = grouped[(grouped['periodo'] >= '2015-01') & (grouped['periodo'] <= '2025-12')]
     
     if is_total:
         result = pd.DataFrame({
             'periodo': grouped['periodo'],
-            'vl_fob': grouped['metricFOB'],
-            'quantum': 0.0,
-            'preco': 0.0
+            'vl_fob': grouped['metricFOB']
         })
     else:
         vl_fob = grouped['metricFOB']
@@ -128,262 +132,308 @@ def process_comex_df(raw_data, is_celulose=False, is_total=False):
         })
     return result.sort_values('periodo').reset_index(drop=True)
 
-# Buscar os dados via API com espaçamento de 10s para respeitar limites
-raw_carne = fetch_comex_data("Carne Bovina", [{"filter": "heading", "values": ["0201", "0202"]}], ["heading"])
-time.sleep(10)
+def get_comex_dataframe(name, filters, details, filename, is_celulose=False, is_total=False):
+    try:
+        raw_data = fetch_comex_data(name, filters, details)
+        if raw_data:
+            print(f"[{name}] Sucesso ao buscar da API Comex Stat.")
+            return process_comex_df(raw_data, is_celulose=is_celulose, is_total=is_total)
+    except Exception as e:
+        print(f"[{name}] API Indisponível/Rate Limit ({e}). Usando backup local: {filename}")
+        
+    file_path = path / filename
+    if not file_path.exists():
+        raise FileNotFoundError(f"Arquivo de backup local não encontrado: {filename}")
+        
+    df_csv = pd.read_csv(file_path, sep=';', decimal=',', encoding='utf-8')
+    df_csv['periodo'] = pd.to_datetime(df_csv['periodo'], format='mixed')
+    
+    # Filtrar período de 10 anos (2015 a 2025)
+    df_csv = df_csv[(df_csv['periodo'] >= '2015-01') & (df_csv['periodo'] <= '2025-12')]
+    
+    if is_total:
+        result = pd.DataFrame({
+            'periodo': df_csv['periodo'],
+            'vl_fob': pd.to_numeric(df_csv['vl_fob'], errors='coerce').fillna(0.0)
+        })
+    else:
+        vl_fob = pd.to_numeric(df_csv['vl_fob'], errors='coerce').fillna(0.0)
+        if 'kg_liquido' in df_csv.columns:
+            kg_liquido = pd.to_numeric(df_csv['kg_liquido'], errors='coerce').fillna(0.0)
+            preco = (vl_fob / kg_liquido).fillna(0.0)
+        else:
+            kg_liquido = 0.0
+            preco = pd.to_numeric(df_csv['preco'], errors='coerce').fillna(0.0)
+            
+        result = pd.DataFrame({
+            'periodo': df_csv['periodo'],
+            'vl_fob': vl_fob,
+            'kg_liquido': kg_liquido,
+            'preco': preco
+        })
+        
+    return result.sort_values('periodo').reset_index(drop=True)
 
-raw_celulose = fetch_comex_data("Celulose", [{"filter": "chapter", "values": ["47"]}], ["heading"])
-time.sleep(10)
+# Buscar e processar os dados históricos da pauta exportadora
+print("\n[Comex Stat] Iniciando extração da série histórica de 10 anos (2015-2025)...")
+df_carne = get_comex_dataframe("Carne Bovina", [{"filter": "heading", "values": ["0201", "0202"]}], ["heading"], "carne_bovina.csv")
+df_celulose = get_comex_dataframe("Celulose", [{"filter": "chapter", "values": ["47"]}], ["heading"], "celulose.csv", is_celulose=True)
+df_maquinas = get_comex_dataframe("Máquinas (Weg)", [{"filter": "heading", "values": ["8501"]}], ["heading"], "maquinas.csv")
+df_total = get_comex_dataframe("Total Indústria", [{"filter": "ISICSection", "values": ["C"]}], ["ISICSection"], "industria_transformacao.csv", is_total=True)
 
-raw_maquinas = fetch_comex_data("Máquinas (Weg)", [{"filter": "heading", "values": ["8501"]}], ["heading"])
-time.sleep(10)
+# Renomear colunas para evitar conflitos no merge
+df_carne = df_carne.rename(columns={'vl_fob': 'vl_fob_carne', 'kg_liquido': 'kg_liquido_carne', 'preco': 'preco_carne'})
+df_celulose = df_celulose.rename(columns={'vl_fob': 'vl_fob_celulose', 'kg_liquido': 'kg_liquido_celulose', 'preco': 'preco_celulose'})
+df_maquinas = df_maquinas.rename(columns={'vl_fob': 'vl_fob_maquinas', 'kg_liquido': 'kg_liquido_maquinas', 'preco': 'preco_maquinas'})
+df_total = df_total.rename(columns={'vl_fob': 'vl_fob_total'})
 
-raw_total = fetch_comex_data("Total Indústria", [{"filter": "ISICSection", "values": ["C"]}], ["ISICSection"])
-
-# Processar as bases
-df_carne = process_comex_df(raw_carne)
-df_celulose = process_comex_df(raw_celulose, is_celulose=True)
-df_maquinas = process_comex_df(raw_maquinas)
-df_total = process_comex_df(raw_total, is_total=True)
-
-# Renomeação das colunas para evitar colisão antes do merge
-df_carne = df_carne.rename(columns={
-    'vl_fob': 'vl_fob_carne', 'kg_liquido': 'kg_liquido_carne', 'preco': 'preco_carne'
-})
-df_celulose = df_celulose.rename(columns={
-    'vl_fob': 'vl_fob_celulose', 'kg_liquido': 'kg_liquido_celulose', 'preco': 'preco_celulose'
-})
-df_maquinas = df_maquinas.rename(columns={
-    'vl_fob': 'vl_fob_maquinas', 'kg_liquido': 'kg_liquido_maquinas', 'preco': 'preco_maquinas'
-})
-df_total = df_total.rename(columns={
-    'vl_fob': 'vl_fob_total', 'quantum': 'quantum_total', 'preco': 'preco_total'
-})
-
-# Junção sequencial com pd.merge
+# Merge sequencial
 df_merged = pd.merge(df_carne, df_celulose, on='periodo', how='inner')
 df_merged = pd.merge(df_merged, df_maquinas, on='periodo', how='inner')
 df_merged = pd.merge(df_merged, df_total, on='periodo', how='inner')
 
-# Cálculo das participações (shares) mensais históricas (%)
+# Cálculo das participações históricas (%)
 df_merged['share_carne'] = (df_merged['vl_fob_carne'] / df_merged['vl_fob_total']) * 100
 df_merged['share_celulose'] = (df_merged['vl_fob_celulose'] / df_merged['vl_fob_total']) * 100
 df_merged['share_maquinas'] = (df_merged['vl_fob_maquinas'] / df_merged['vl_fob_total']) * 100
 
-
 # ==========================================
-# --- 3. EXTRAÇÃO FINANCEIRA E CÁLCULOS ---
+# --- 4. MOTOR FINANCEIRO E INDICADORES ---
 # ==========================================
-def encontrar_contas_contabeis(df):
-    ativo_total = float(df[df["conta"]=='1']['valor'].iloc[0])
-    ativo_circ = float(df[df["conta"]=='1.01']['valor'].iloc[0])
-    passivo_circ = float(df[df["conta"]=='2.01']['valor'].iloc[0])
-    passivo_n_circ = float(df[df["conta"]=='2.02']['valor'].iloc[0])
+def get_value(df, conta):
+    res = df[df['conta'] == conta]
+    if res.empty:
+        res = df[df['conta'].str.replace('.', '', regex=False) == conta.replace('.', '', regex=False)]
+    if not res.empty:
+        val = res.iloc[0]['valor']
+        return float(val) if val is not None else 0.0
+    return 0.0
+
+def calcular_indicadores_financeiros(ticker, year):
+    periodo = f"{year}4T"
+    resp = requests.get(f"{base_url}/bolsa/balanco", headers=headers, params={"ticker": ticker, "ano_tri": periodo})
+    if resp.status_code != 200 or len(resp.json()) == 0:
+        # Fallback para o 3T no caso de atraso na publicação do balanço anual
+        if year == 2025:
+            periodo = "20253T"
+            resp = requests.get(f"{base_url}/bolsa/balanco", headers=headers, params={"ticker": ticker, "ano_tri": periodo})
+            if resp.status_code != 200 or len(resp.json()) == 0:
+                return None
+        else:
+            return None
+            
+    data = resp.json()[0]
+    df = pd.DataFrame(data['balanco'])
     
-    filtro_arlp = df["conta"] == '1.02.01'
-    arlp = float(df[filtro_arlp]['valor'].iloc[0]) if not df[filtro_arlp].empty else 0.0
+    # 1. Balanço Patrimonial (BP)
+    ativo_total = get_value(df, '1')
+    pl = get_value(df, '2.03')
+    pc = get_value(df, '2.01')
+    pnc = get_value(df, '2.02')
     
-    filtro_estoque = df["descricao"].str.contains('estoque', case=False)
-    estoque = float(df[filtro_estoque]['valor'].iloc[0]) if not df[filtro_estoque].empty else 0.0
-
-    filtro_disponibilidades = df["conta"].isin(['1.01.01', '1.01.02'])
-    caixa_equivalentes = df[filtro_disponibilidades]['valor'].astype(float).sum()
-
-    filtro_despesa = df["descricao"].str.contains('antecipada', case=False)
-    despesa_antecipada = float(df[filtro_despesa]['valor'].iloc[0]) if not df[filtro_despesa].empty else 0.0
-
+    # 2. Demonstração de Resultado do Exercício (DRE)
+    receita = get_value(df, '3.01')
+    lucro_bruto = get_value(df, '3.03')
+    ebit = get_value(df, '3.05')
+    lucro_liquido = get_value(df, '3.11')
+    
+    # Depreciação e Amortização (obtido da DVA ou DFC para totalizadores de depreciação)
+    depre = abs(get_value(df, '7.04'))
+    if depre == 0.0:
+        depre = abs(get_value(df, '6.01.01.02'))
+        
+    ebitda = ebit + depre
+    
+    # NOPAT (Fórmula do Excel: EBITDA - Imposto de Renda Corrente)
+    ir_corrente = get_value(df, '3.08.01')
+    nopat = ebitda - ir_corrente
+    
+    # Investimento (Ativo Total)
+    passivo_oneroso = pc + pnc
+    investimento = passivo_oneroso + pl # Equivalente ao Ativo Total
+    
+    # Margens
+    margem_bruta = lucro_bruto / receita if receita != 0 else 0
+    margem_ebitda = ebitda / receita if receita != 0 else 0
+    margem_ebit = ebit / receita if receita != 0 else 0
+    margem_nopat = nopat / receita if receita != 0 else 0
+    margem_liquida = lucro_liquido / receita if receita != 0 else 0
+    
+    # ROI & ROE & GAF
+    roi = nopat / investimento if investimento != 0 else 0
+    roe = lucro_liquido / pl if pl != 0 else 0
+    gaf = roe / roi if roi != 0 else 0
+    
+    # CMPC (WACC)
+    w1 = passivo_oneroso / investimento if investimento != 0 else 0
+    w2 = pl / investimento if investimento != 0 else 0
+    
+    # Alíquota Efetiva de IR/CSLL
+    lair = get_value(df, '3.07')
+    ir_total = get_value(df, '3.08')
+    ratio = ir_total / lair if lair != 0 else 0.34
+    t = 0.34 if (ratio > 1.0 or ratio < 0.0) else ratio
+    
+    # Despesa Financeira Líquida e Custo da Dívida
+    despesa_financeira = abs(get_value(df, '3.06.02'))
+    dfl = despesa_financeira * (1.0 - t)
+    ki = dfl / passivo_oneroso if passivo_oneroso != 0 else 0
+    ke = 0.16
+    
+    cmpc = (w1 * ki) + (w2 * ke)
+    
+    # EVA
+    eva = (roi - cmpc) * investimento
+    
     return {
-        "ativo_total": ativo_total,
-        "ativo_circ": ativo_circ,
-        "passivo_circ": passivo_circ,
-        "passivo_n_circ": passivo_n_circ,
-        "arlp": arlp,
-        "estoque": estoque,
-        "despesa_antecipada": despesa_antecipada,
-        "caixa_equivalentes": caixa_equivalentes
+        "receita": receita,
+        "lucro_bruto": lucro_bruto,
+        "ebitda": ebitda,
+        "ebit": ebit,
+        "nopat": nopat,
+        "lucro_liquido": lucro_liquido,
+        "investimento": investimento,
+        "margem_bruta": margem_bruta,
+        "margem_ebitda": margem_ebitda,
+        "margem_ebit": margem_ebit,
+        "margem_nopat": margem_nopat,
+        "margem_liquida": margem_liquida,
+        "roi": roi,
+        "roe": roe,
+        "gaf": gaf,
+        "cmpc": cmpc,
+        "eva": eva
     }
 
-def calcular_indicadores(d, roi, cmpc):
-    # Investimento (Capital Empregado) = Ativo Total - Passivo Circulante
-    investimento = d["ativo_total"] - d["passivo_circ"]
-    
-    return {
-        'ccl': d["ativo_circ"] - d["passivo_circ"],
-        'lc': d["ativo_circ"] / d["passivo_circ"],
-        'lg': (d["ativo_circ"] + d["arlp"]) / (d["passivo_circ"] + d["passivo_n_circ"]),
-        'ls': (d["ativo_circ"] - d["estoque"] - d["despesa_antecipada"]) / d["passivo_circ"],
-        'la': d["caixa_equivalentes"] / d["passivo_circ"],
-        'eva': (roi - cmpc) * investimento
-    }
-
-resultados_financeiros = {}
-
-print("\n### STATUS DE CONEXÃO COM A API ###")
-for nome, ticker in tickers.items():
-    # Sistema de Fallback: Se 20254T não estiver disponível, tenta os trimestres anteriores
-    periodos_tentativa = ["20254T", "20253T", "20244T"]
-    dados_encontrados = False
-    
-    for periodo in periodos_tentativa:
-        resp = requests.get(f"{base_url}/bolsa/balanco", headers=headers, params={"ticker": ticker, "ano_tri": periodo})
-        
-        if resp.status_code == 200 and len(resp.json()) > 0:
-            try:
-                df_balanco = pd.DataFrame(resp.json()[0]['balanco'])
-                contas = encontrar_contas_contabeis(df_balanco)
-                
-                roi = parametros_eva[ticker]['roi']
-                cmpc = parametros_eva[ticker]['cmpc']
-                
-                indicadores = calcular_indicadores(contas, roi, cmpc)
-                resultados_financeiros[nome] = indicadores
-                
-                print(f"[{nome}] OK - Dados processados (Referência: {periodo})")
-                dados_encontrados = True
-                break
-            except IndexError:
-                continue
-                
-    if not dados_encontrados:
-        resultados_financeiros[nome] = None
-        print(f"[{nome}] FALHA - Dados não encontrados em nenhum período.")
-
+financial_results = {}
+for name, ticker in tickers.items():
+    financial_results[name] = {}
+    for year in [2024, 2025]:
+        financial_results[name][year] = calcular_indicadores_financeiros(ticker, year)
 
 # ==========================================
-# --- 4. EXIBIÇÃO ESTRUTURADA DOS RESULTADOS ---
+# --- 5. EXIBIÇÃO DE RESULTADOS (TERMINAL) --
 # ==========================================
-print("\n### RESULTADOS DE EXPORTAÇÃO (2025) ###")
-print(f"* Exportação Total da Indústria de Transformação: US$ {total_it_usd/1e9:.2f} Bilhões")
-print(f"* Índice de Concentração (HHI) da Pauta: {hhi_pauta:.4f}")
+print("\n" + "="*80)
+print("             INDICADORES CORPORATIVOS E DRE GERENCIAL (2024 vs 2025)            ")
+print("="*80)
 
-for index, row in df_empresas.iterrows():
-    print(f"* Participação {row['Empresa']}: {row['Participacao_IT_%']:.4f}%")
+for name in tickers.keys():
+    print(f"\n>>> {name.upper()} ({tickers[name]})")
+    for year in [2024, 2025]:
+        res = financial_results[name].get(year)
+        if not res:
+            print(f"  [{year}] Dados não disponíveis.")
+            continue
+            
+        print(f"\n  Ano de Referência: {year}")
+        print(f"  -------------------------------------------------------------")
+        print(f"  DRE GERENCIAL:")
+        print(f"    Receita Líquida:                 R$ {res['receita']:18,.2f}")
+        print(f"    Lucro Bruto:                     R$ {res['lucro_bruto']:18,.2f}")
+        print(f"    EBIT:                            R$ {res['ebit']:18,.2f}")
+        print(f"    EBITDA:                          R$ {res['ebitda']:18,.2f}")
+        print(f"    NOPAT:                           R$ {res['nopat']:18,.2f}")
+        print(f"    Lucro Líquido:                   R$ {res['lucro_liquido']:18,.2f}")
+        print(f"  INDICADORES FINANCEIROS:")
+        print(f"    Margem Bruta:                    {res['margem_bruta']*100:18.4f}%")
+        print(f"    Margem EBITDA:                   {res['margem_ebitda']*100:18.4f}%")
+        print(f"    Margem EBIT:                     {res['margem_ebit']*100:18.4f}%")
+        print(f"    Margem NOPAT:                    {res['margem_nopat']*100:18.4f}%")
+        print(f"    Margem Líquida:                  {res['margem_liquida']*100:18.4f}%")
+        print(f"    Retorno sobre Investimento (ROI):{res['roi']*100:18.4f}%")
+        print(f"    Retorno sobre o Equity (ROE):    {res['roe']*100:18.4f}%")
+        print(f"    Grau de Alavancagem Fin. (GAF):  {res['gaf']:18.4f}x")
+        print(f"    Custo Médio de Capital (CMPC):   {res['cmpc']*100:18.4f}%")
+        print(f"    Valor Econômico Adicionado (EVA):R$ {res['eva']:18,.2f}")
+    print("="*80)
 
-
-print("\n### INDICADORES FINANCEIROS DE LIQUIDEZ E CRIAÇÃO DE VALOR ###")
-for nome in tickers.keys():
-    print(f"\n**{nome.upper()} ({tickers[nome]})**")
-    if resultados_financeiros[nome]:
-        ind = resultados_financeiros[nome]
-        
-        ccl_formatado = f"R$ {ind['ccl']:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
-        eva_formatado = f"R$ {ind['eva']:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
-        
-        print(f"  * Capital Circulante Líquido (CCL): {ccl_formatado}")
-        print(f"  * Liquidez Corrente (LC): {ind['lc']:.4f}")
-        print(f"  * Liquidez Geral (LG): {ind['lg']:.4f}")
-        print(f"  * Liquidez Seca (LS): {ind['ls']:.4f}")
-        print(f"  * Liquidez Imediata (LA): {ind['la']:.4f}")
-        print(f"  * Economic Value Added (EVA): {eva_formatado}")
-    else:
-        print("  * Dados não disponíveis.")
-
-print("\n### ANÁLISE HISTÓRICA E EVOLUÇÃO DAS EXPORTAÇÕES (2016-2026) ###")
-print(f"* Média de Participação Histórica no Total da Indústria:")
-print(f"  * Carne Bovina (Marfrig): {df_merged['share_carne'].mean():.4f}%")
-print(f"  * Celulose (Klabin): {df_merged['share_celulose'].mean():.4f}%")
-print(f"  * Máquinas (Weg): {df_merged['share_maquinas'].mean():.4f}%")
-
+print("\n" + "="*80)
+print("               ANÁLISE HISTÓRICA DE EXPORTAÇÕES (2015-2025)             ")
+print("="*80)
+print("  Média de Participação Histórica na Indústria de Transformação:")
+print(f"    Carne Bovina (Marfrig):           {df_merged['share_carne'].mean():.4f}%")
+print(f"    Celulose (Klabin):                {df_merged['share_celulose'].mean():.4f}%")
+print(f"    Máquinas (Weg):                   {df_merged['share_maquinas'].mean():.4f}%")
+print("="*80)
 
 # ==========================================
-# --- 5. VISUALIZAÇÃO GRÁFICA (PADRÃO ACADÊMICO) ---
+# --- 6. VISUALIZAÇÃO GRÁFICA --------------
 # ==========================================
-# Configurações globais para estilo de publicação científica (monocromático azul / sem hachuras)
 plt.rcParams['font.family'] = 'serif'
 plt.rcParams['font.size'] = 10
 plt.rcParams['axes.edgecolor'] = 'black'
 plt.rcParams['axes.linewidth'] = 1.0
 
-# --- Gráfico 1: Participação no Volume de Exportações (Rosca / Donut Chart) ---
-# Cálculo das parcelas considerando o total da indústria de transformação
-val_marfrig = (receitas_br_brl['Marfrig'] * 1e9) / CAMBIO_2025
-val_klabin = (receitas_br_brl['Klabin'] * 1e9) / CAMBIO_2025
-val_weg = (receitas_br_brl['Weg'] * 1e9) / CAMBIO_2025
-val_outros = total_it_usd - (val_marfrig + val_klabin + val_weg)
+# --- Gráfico A: Comparação de EVA 2024 vs 2025 ---
+companies = list(tickers.keys())
+eva_2024 = [financial_results[c][2024]['eva'] / 1e6 for c in companies]
+eva_2025 = [financial_results[c][2025]['eva'] / 1e6 for c in companies]
 
-labels_g1 = ['Marfrig (Carne Bovina)', 'Weg (Máquinas)', 'Klabin (Celulose)', 'Outros Setores']
-sizes_g1 = [val_marfrig, val_weg, val_klabin, val_outros]
-shares_g1 = [s / total_it_usd * 100 for s in sizes_g1]
+x = np.arange(len(companies))
+width = 0.35
 
-# Paleta monocromática de tons de azul
-colors_g1 = ['#0f2d59', '#3182ce', '#90cdf4', '#e2e8f0']
+fig, ax = plt.subplots(figsize=(8, 6))
+rects1 = ax.bar(x - width/2, eva_2024, width, label='2024', color='#3182ce', edgecolor='black', linewidth=1.2)
+rects2 = ax.bar(x + width/2, eva_2025, width, label='2025', color='#0f2d59', edgecolor='black', linewidth=1.2)
 
-fig1, ax1 = plt.subplots(figsize=(8, 6))
-wedges, texts = ax1.pie(
-    shares_g1, 
-    startangle=140, 
-    colors=colors_g1, 
-    wedgeprops=dict(width=0.4, edgecolor='black', linewidth=1.2)
-)
+ax.axhline(0, color='black', linewidth=1.2)
+ax.set_ylabel('EVA (em Milhões de R$)', fontweight='bold')
+ax.set_title('Comparação de EVA por Companhia (2024 vs 2025)', fontweight='bold', pad=15)
+ax.set_xticks(x)
+ax.set_xticklabels(companies, fontweight='bold')
+ax.legend(frameon=True, edgecolor='black')
+ax.grid(axis='y', linestyle='--', alpha=0.5)
 
-# Rótulos com percentuais na legenda lateral para evitar sobreposições
-legend_labels = [f'{lbl}: {sh:.2f}%' for lbl, sh in zip(labels_g1, shares_g1)]
-ax1.legend(wedges, legend_labels, title="Empresa / Setor", loc="center left", bbox_to_anchor=(1, 0.5), frameon=True, edgecolor='black')
-ax1.set_title("Participação das Empresas nas Exportações Totais da Indústria (2025)", fontweight='bold', pad=15)
+# Remover linhas superior e direita
+ax.spines['top'].set_visible(False)
+ax.spines['right'].set_visible(False)
+
+# Rótulos automáticos
+all_evas = eva_2024 + eva_2025
+max_val = max(all_evas)
+min_val = min(all_evas)
+y_range = max_val - min_val
+offset = 0.02 * y_range
+
+ax.set_ylim(min_val - 0.3 * y_range, max_val + 0.15 * y_range)
+
+
+def autolabel(rects):
+    for rect in rects:
+        height = rect.get_height()
+        pos = height + offset if height >= 0 else height - offset
+        va = 'bottom' if height >= 0 else 'top'
+        ax.text(rect.get_x() + rect.get_width()/2., pos,
+                f'R$ {height:,.2f} M'.replace(',', 'X').replace('.', ',').replace('X', '.'),
+                ha='center', va=va, fontsize=8, fontweight='bold')
+
+autolabel(rects1)
+autolabel(rects2)
+
 plt.tight_layout()
-plt.show()
 
-# --- Gráfico 2: Comparação de EVA (Barras Monocromáticas com Rótulos) ---
-# Extração dos dados de EVA
-empresas_eva = []
-valores_eva_milhoes = []
-for nome in tickers.keys():
-    if resultados_financeiros[nome] and 'eva' in resultados_financeiros[nome]:
-        empresas_eva.append(nome)
-        valores_eva_milhoes.append(resultados_financeiros[nome]['eva'] / 1e6)
+# --- Gráfico B: Série Temporal de Exportações ---
+fig2, ax2 = plt.subplots(figsize=(10, 6))
+ax2.plot(df_merged['periodo'], df_merged['share_carne'], label='Carne Bovina (Marfrig)', color='#0f2d59', linewidth=2)
+ax2.plot(df_merged['periodo'], df_merged['share_celulose'], label='Celulose (Klabin)', color='#90cdf4', linewidth=2)
+ax2.plot(df_merged['periodo'], df_merged['share_maquinas'], label='Máquinas (Weg)', color='#3182ce', linewidth=2)
 
-if empresas_eva:
-    # Paleta de tons de azul para as barras correspondentes (Marfrig, Klabin, Weg)
-    colors_g2 = ['#0f2d59', '#90cdf4', '#3182ce']
-    
-    fig2, ax2 = plt.subplots(figsize=(8, 6))
-    bars = ax2.bar(empresas_eva, valores_eva_milhoes, color=colors_g2, edgecolor='black', linewidth=1.2, width=0.4)
-    
-    ax2.axhline(0, color='black', linewidth=1.5)
-    
-    # Rótulo com valores formatados acima das barras
-    for bar in bars:
-        yval = bar.get_height()
-        posicao_texto = yval + 0.05 if yval >= 0 else yval - 0.15
-        ax2.text(
-            bar.get_x() + bar.get_width()/2, 
-            posicao_texto, 
-            f'R$ {yval:,.2f} mi'.replace(',', 'X').replace('.', ',').replace('X', '.'), 
-            ha='center', va='bottom' if yval >= 0 else 'top', fontweight='bold'
-        )
-        
-    ax2.set_ylabel('EVA Estimado (em Milhões de R$)', fontweight='bold')
-    ax2.set_title('Comparação da Criação de Valor (Economic Value Added - EVA)', fontweight='bold', pad=15)
-    
-    # Ajusta os limites e layout para padrão acadêmico
-    ax2.set_ylim(0, max(valores_eva_milhoes) * 1.25)
-    ax2.spines['top'].set_visible(False)
-    ax2.spines['right'].set_visible(False)
-    ax2.grid(axis='y', linestyle='--', alpha=0.5)
-    plt.tight_layout()
-    plt.show()
+ax2.set_title('Participação Histórica nas Exportações da Indústria de Transformação (2015-2025)', fontweight='bold', pad=15)
+ax2.set_xlabel('Período', fontweight='bold')
+ax2.set_ylabel('% de Participação', fontweight='bold')
 
-# --- Gráfico 3: Evolução Histórica das Participações (Série Temporal) ---
-fig3, ax3 = plt.subplots(figsize=(10, 6))
-ax3.plot(
-    df_merged['periodo'], df_merged['share_carne'], 
-    label='Carne Bovina (Marfrig)', color='#0f2d59', linestyle='-', linewidth=2
-)
-ax3.plot(
-    df_merged['periodo'], df_merged['share_celulose'], 
-    label='Celulose (Klabin)', color='#90cdf4', linestyle='-', linewidth=2
-)
-ax3.plot(
-    df_merged['periodo'], df_merged['share_maquinas'], 
-    label='Máquinas (Weg)', color='#3182ce', linestyle='-', linewidth=2
-)
+# Configurar limites e ticks do eixo X para focar exatamente entre 2015 e 2025
+ax2.set_xlim(pd.Timestamp('2015-01-01'), pd.Timestamp('2025-12-01'))
+ticks = pd.to_datetime(['2015-01-01', '2017-01-01', '2019-01-01', '2021-01-01', '2023-01-01', '2025-01-01'])
+ax2.set_xticks(ticks)
+ax2.set_xticklabels(['2015', '2017', '2019', '2021', '2023', '2025'])
 
-ax3.set_title('Evolução da Participação dos Setores nas Exportações Totais da Indústria de Transformação (2016-2026)', fontweight='bold', pad=15)
-ax3.set_xlabel('Período', fontweight='bold')
-ax3.set_ylabel('% de Participação', fontweight='bold')
-ax3.legend(frameon=True, edgecolor='black')
-ax3.grid(True, linestyle='--', alpha=0.5)
-ax3.spines['top'].set_visible(False)
-ax3.spines['right'].set_visible(False)
+ax2.legend(frameon=True, edgecolor='black')
+ax2.grid(True, linestyle='--', alpha=0.5)
+ax2.spines['top'].set_visible(False)
+ax2.spines['right'].set_visible(False)
 plt.tight_layout()
+
+# Exibir os gráficos na tela
 plt.show()
